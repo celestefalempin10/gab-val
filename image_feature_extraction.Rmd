@@ -102,48 +102,121 @@ The idea is simple: every row in `labels` corresponds to one image (in the same 
 
 ---
 
-# Question 4 — Colour histograms (RGB and HSV)
+# Question 4 — Extracting Colour Histograms (RGB and HSV)
 
-We use `colordistance::getImageHist()` to build histograms with **3 bins per channel**, giving us 27 values per image for RGB (3³) and 27 for HSV. Then we bolt both sets onto the labels data frame.
+## What this question asks
 
-```{r colour-histograms}
-n_bins <- 3   # bins per channel
+This question requires us to:
 
-# helper: extract histogram and return a named numeric vector
+1. Import the **label dataset** (brand and product type) using `read.csv()`.
+2. Extract **RGB colour histograms** from all images using `getImageHist()` from the `colordistance` package.
+3. Repeat the extraction in **HSV colour space**.
+4. Use exactly **3 bins per channel** in both cases, producing 3³ = **27 features** per image per colour space.
+5. Ensure all features are stored as plain **numeric values**.
+6. Build one **RGB feature matrix** and one **HSV feature matrix**, then **append both to the label dataset**.
+7. Explain what colour histograms capture about an image.
+
+---
+
+## Step 4a — Import the label dataset
+
+We first load the CSV that contains one row per image with the ground-truth labels we want to predict: **brand** and **product type**. These will be the target columns once we attach the image features.
+
+```{r load-labels-q4}
+labels <- read.csv(labels_csv, stringsAsFactors = FALSE)
+
+cat("Rows:", nrow(labels), "\n")
+cat("Columns:", paste(names(labels), collapse = ", "), "\n")
+head(labels)
+
+cat("\nBrand counts:\n");        print(table(labels$brand))
+cat("\nProduct type counts:\n"); print(table(labels$productType))
+```
+
+Each row in `labels` corresponds to one image file (in the same order the files appear on disk). As we extract features from each image we will add new columns to this data frame — one per feature — so that by the end every row holds both the numeric image description **and** the label to predict. This combined table is what gets fed into the classifier.
+
+---
+
+## Step 4b — Extract RGB colour histograms
+
+`getImageHist()` reads an image directly from its file path, divides each colour channel into the requested number of equal-width bins, and counts what fraction of pixels fall in each bin. Setting `bins = 3` gives 3 bins per channel, so 3 × 3 × 3 = **27 bins** in total.
+
+The function returns a data frame; we pull out the `Pct` column (the per-bin pixel fractions) and coerce it to a plain numeric vector so every row of the resulting matrix is in a consistent numeric format.
+
+```{r rgb-histograms}
+n_bins <- 3   # 3 bins per channel → 27 features per image
+
+# helper: run getImageHist and return a plain numeric vector
 get_hist_vec <- function(path, color_space) {
   h <- getImageHist(path,
-                    bins   = n_bins,
+                    bins        = n_bins,
                     color.space = color_space,
-                    plotting = FALSE)
-  # getImageHist returns a data frame; we want the 'Pct' column as a vector
-  as.numeric(h$Pct)
+                    plotting    = FALSE)
+  as.numeric(h$Pct)   # pixel fraction for each of the 27 bins
 }
 
-# RGB histograms
+# extract for every image
 cat("Extracting RGB histograms...\n")
 rgb_list <- lapply(seq_along(image_paths), function(i) {
   if (i %% 200 == 0) cat("  processed", i, "/", length(image_paths), "\n")
   get_hist_vec(image_paths[i], "rgb")
 })
+
+# stack into one matrix: rows = images, columns = histogram bins
 rgb_matrix <- do.call(rbind, rgb_list)
 colnames(rgb_matrix) <- paste0("rgb_", seq_len(ncol(rgb_matrix)))
 
-# HSV histograms
+cat("RGB matrix dimensions:", nrow(rgb_matrix), "x", ncol(rgb_matrix), "\n")
+cat("All numeric?", all(apply(rgb_matrix, 2, is.numeric)), "\n")
+```
+
+---
+
+## Step 4c — Extract HSV colour histograms
+
+We repeat exactly the same procedure but pass `color.space = "hsv"`. The HSV space decomposes colour into **Hue** (the actual colour tone), **Saturation** (how vivid it is), and **Value** (how bright or dark). This gives a different angle on colour than raw RGB, which is why both are useful.
+
+```{r hsv-histograms}
 cat("Extracting HSV histograms...\n")
 hsv_list <- lapply(seq_along(image_paths), function(i) {
   if (i %% 200 == 0) cat("  processed", i, "/", length(image_paths), "\n")
   get_hist_vec(image_paths[i], "hsv")
 })
+
 hsv_matrix <- do.call(rbind, hsv_list)
 colnames(hsv_matrix) <- paste0("hsv_", seq_len(ncol(hsv_matrix)))
 
-# append to labels
-labels <- cbind(labels, rgb_matrix, hsv_matrix)
-
-cat("Feature columns so far:", ncol(labels), "\n")
+cat("HSV matrix dimensions:", nrow(hsv_matrix), "x", ncol(hsv_matrix), "\n")
+cat("All numeric?", all(apply(hsv_matrix, 2, is.numeric)), "\n")
 ```
 
-A colour histogram just counts how many pixels fall into each colour "bucket". With 3 bins per channel you're essentially asking: for red, is there mostly low, medium, or high red? Same for green and blue (or hue, saturation, value for HSV). It doesn't care about *where* colours are in the image — just *how much* of each colour there is overall. That makes it fast to compute and surprisingly useful for telling clothing styles apart.
+---
+
+## Step 4d — Append both feature matrices to the label dataset
+
+We use `cbind()` to attach the 27 RGB columns and the 27 HSV columns to the right of the labels data frame. Because every matrix has exactly as many rows as `labels` has rows (one per image, in the same order), the join is purely positional — no key column needed.
+
+```{r append-colour-features}
+labels <- cbind(labels, rgb_matrix, hsv_matrix)
+
+cat("Total columns in labels after appending colour features:", ncol(labels), "\n")
+cat("First few column names:", paste(names(labels)[1:10], collapse = ", "), "...\n")
+```
+
+---
+
+## What information do colour histograms capture?
+
+A colour histogram answers one question: **how much of each colour is present in the image?** It divides each colour channel into bins and records what fraction of pixels fall in each bin.
+
+| Colour space | What the three channels represent |
+|---|---|
+| **RGB** | How much **red**, **green**, and **blue** light makes up the overall palette |
+| **HSV** | **Hue** — the colour tone (red vs. blue vs. green); **Saturation** — how vivid vs. washed-out; **Value** — how bright vs. dark |
+
+With 3 bins per channel and 27 bins total, the histogram gives a coarse but compact summary of the colour palette. Critically, it is **position-agnostic**: it does not matter where in the image the red pixels are, only how many there are. This makes histograms robust to small shifts, rotations, and scale changes, and fast to compute across thousands of images.
+
+For clothing classification specifically, colour histograms are informative because different brands and product types tend to have characteristic colour palettes — denim jeans skew blue, formal shirts tend towards whites and light blues, and some brands have distinctive signature colours. These 54 features (27 RGB + 27 HSV) therefore give the classifier a meaningful colour fingerprint for each garment before any shape or texture information is added.
 
 ---
 
