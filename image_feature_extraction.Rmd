@@ -139,8 +139,9 @@ for (i in seq_along(images)) {
   gray_img  <- grayscale(images[[i]])
   edges     <- cannyEdges(gray_img)
   hl        <- hough_line(edges, ntheta = 800)
-  threshold <- quantile(hl$score, probs = 0.995)
-  n_lines_vec[i] <- sum(hl$score >= threshold)
+  scores    <- as.numeric(hl)
+  threshold <- quantile(scores, probs = 0.995)
+  n_lines_vec[i] <- sum(scores >= threshold)
 }
 
 labels$n_important_lines <- n_lines_vec
@@ -153,7 +154,7 @@ cat("Line feature added. Sample values:", head(n_lines_vec, 10), "\n")
 - **Grayscale conversion** — `grayscale()` collapses the three colour channels into one intensity channel. Both Canny and Hough work on brightness only, so colour information is not needed and would just complicate the computation.
 - **Canny edge detection** — `cannyEdges()` produces a binary map where each pixel is either an edge (1) or not (0). It does this by finding where pixel brightness changes sharply, then thinning those regions down to single-pixel-wide lines.
 - **Hough line detection** — `hough_line(edges, ntheta = 800)` scans the edge map looking for straight lines. The `ntheta = 800` argument means it tests 800 different angles evenly spaced between 0° and 180°, giving finer angular resolution and more precise line orientations.
-- **Percentile threshold** — `quantile(hl$score, probs = 0.995)` finds the score value that only the top 0.5 % of detected lines exceed. We then count only those lines, discarding the weaker, noisier detections. This gives one integer per image — the number of structurally prominent straight lines.
+- **Percentile threshold** — `hough_line()` returns a matrix where each cell value is the score for a (distance, angle) pair. We flatten it with `as.numeric()` and use `quantile(..., probs = 0.995)` to find the top 0.5 % threshold. Counting cells at or above that threshold gives one integer per image — the number of structurally prominent straight lines.
 - **Why edge detection must come first** — the Hough transform works by voting: each edge pixel casts votes for every line it could belong to, and lines accumulate votes where many edge pixels agree. If you fed it a raw grayscale image there would be no binary edge pixels to vote — just continuous brightness gradients. Canny turns those gradients into a clean, sparse map of actual boundaries, giving Hough the crisp input it needs to detect meaningful lines rather than noise.
 
 ---
