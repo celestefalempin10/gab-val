@@ -1,0 +1,316 @@
+---
+title: "Image Feature Extraction Assignment"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+---
+
+# Setup — telling R where your files live
+
+Before anything else, just set these two paths to match wherever you saved the images folder and the CSV on your computer. Everything else in the script will use these.
+
+```{r paths}
+# ---- CHANGE THESE TO MATCH YOUR SETUP ----
+images_dir <- "images"   # folder containing all the .png files
+labels_csv  <- "labels.csv"  # the csv with brand / product-type columns
+# ------------------------------------------
+```
+
+---
+
+# Question 1 — Loading the libraries
+
+Here we load the four image-processing libraries the assignment needs. Each one brings different tools to the table, so it makes sense to think of them as specialists.
+
+```{r libraries}
+library(pixmap)         # colour / pixel-level image representation
+library(imager)         # edge detection (Canny) and general image manipulation
+library(OpenImageR)     # Gabor texture filters
+library(colordistance)  # colour histogram extraction (RGB & HSV)
+
+# extra libraries needed for modelling and evaluation
+library(e1071)          # SVM
+library(MLmetrics)      # accuracy / F1 / recall
+```
+
+So to break it down quickly:
+
+- **pixmap** — mainly for *colour* (reading and working with raw pixel data)
+- **imager** — mainly for *shape* (edge detection, contour stuff)
+- **OpenImageR** — mainly for *texture* (Gabor filters)
+- **colordistance** — mainly for *colour* (building colour histograms)
+
+---
+
+# Question 2 — Loading all 2 184 images
+
+We grab every PNG file from the images folder, load each one with `imager`, and immediately drop the alpha (transparency) channel if it's there, keeping only the three RGB channels. At the end we do a quick sanity check and show one image.
+
+```{r load-images}
+# collect all png paths
+image_paths <- list.files(images_dir, pattern = "\\.png$",
+                          full.names = TRUE, recursive = FALSE)
+
+cat("Total images found:", length(image_paths), "\n")
+
+# load and strip alpha channel
+images <- lapply(image_paths, function(p) {
+  img <- load.image(p)
+  # imager stores channels in the 4th dimension; keep only channels 1-3
+  if (dim(img)[4] == 4) {
+    img <- img[, , , 1:3, drop = FALSE]
+    img <- as.cimg(img)
+  }
+  img
+})
+
+# verify dimensions on the first image
+cat("Channels in image 1:", dim(images[[1]])[4], "\n")
+cat("Dimensions (W x H x D x C):", paste(dim(images[[1]]), collapse = " x "), "\n")
+```
+
+```{r show-example-image, fig.cap="Example clothing image after alpha removal"}
+plot(images[[1]], main = "Example image — 3 channels only")
+```
+
+Removing the alpha channel matters because most of the feature-extraction functions we use later expect exactly three channels (R, G, B). If there's a fourth transparency channel hanging around, those functions either crash or produce garbage, so we get rid of it up front.
+
+---
+
+# Question 3 — Loading the labels
+
+We read the CSV, take a peek at what columns are there, and confirm we have a brand column and a product-type column to predict.
+
+```{r load-labels}
+labels <- read.csv(labels_csv, stringsAsFactors = FALSE)
+
+# quick look at the data
+cat("Rows:", nrow(labels), "\n")
+cat("Columns:", paste(names(labels), collapse = ", "), "\n")
+head(labels)
+
+# check class balance (adjust column names if yours differ)
+cat("\nBrand counts:\n");   print(table(labels$brand))
+cat("\nProduct type counts:\n"); print(table(labels$product_type))
+```
+
+The idea is simple: every row in `labels` corresponds to one image (in the same order as the files in the folder). As we extract features from each image we'll create new columns — one per feature — and tack them onto this data frame. By the end we have one big table where each row is an image with its features *and* its labels, ready to feed into a model.
+
+---
+
+# Question 4 — Colour histograms (RGB and HSV)
+
+We use `colordistance::getImageHist()` to build histograms with **3 bins per channel**, giving us 27 values per image for RGB (3³) and 27 for HSV. Then we bolt both sets onto the labels data frame.
+
+```{r colour-histograms}
+n_bins <- 3   # bins per channel
+
+# helper: extract histogram and return a named numeric vector
+get_hist_vec <- function(path, color_space) {
+  h <- getImageHist(path,
+                    bins   = n_bins,
+                    color.space = color_space,
+                    plotting = FALSE)
+  # getImageHist returns a data frame; we want the 'Pct' column as a vector
+  as.numeric(h$Pct)
+}
+
+# RGB histograms
+cat("Extracting RGB histograms...\n")
+rgb_list <- lapply(seq_along(image_paths), function(i) {
+  if (i %% 200 == 0) cat("  processed", i, "/", length(image_paths), "\n")
+  get_hist_vec(image_paths[i], "rgb")
+})
+rgb_matrix <- do.call(rbind, rgb_list)
+colnames(rgb_matrix) <- paste0("rgb_", seq_len(ncol(rgb_matrix)))
+
+# HSV histograms
+cat("Extracting HSV histograms...\n")
+hsv_list <- lapply(seq_along(image_paths), function(i) {
+  if (i %% 200 == 0) cat("  processed", i, "/", length(image_paths), "\n")
+  get_hist_vec(image_paths[i], "hsv")
+})
+hsv_matrix <- do.call(rbind, hsv_list)
+colnames(hsv_matrix) <- paste0("hsv_", seq_len(ncol(hsv_matrix)))
+
+# append to labels
+labels <- cbind(labels, rgb_matrix, hsv_matrix)
+
+cat("Feature columns so far:", ncol(labels), "\n")
+```
+
+A colour histogram just counts how many pixels fall into each colour "bucket". With 3 bins per channel you're essentially asking: for red, is there mostly low, medium, or high red? Same for green and blue (or hue, saturation, value for HSV). It doesn't care about *where* colours are in the image — just *how much* of each colour there is overall. That makes it fast to compute and surprisingly useful for telling clothing styles apart.
+
+---
+
+# Question 5 — Edge detection and line detection
+
+First we convert each image to grayscale (Canny only works on single-channel images), then detect edges with `cannyEdges()`, then run `hough_line()` on those edges. We only keep lines whose score hits the **99.5th percentile** threshold, and the feature is simply the count of those important lines.
+
+```{r edge-line-detection}
+n_lines_vec <- numeric(length(images))
+
+cat("Running edge + line detection...\n")
+for (i in seq_along(images)) {
+  if (i %% 200 == 0) cat("  processed", i, "/", length(images), "\n")
+
+  # grayscale
+  gray_img <- grayscale(images[[i]])
+
+  # Canny edges
+  edges <- cannyEdges(gray_img)
+
+  # Hough line transform (theta = 800 as specified)
+  hl <- hough_line(edges, theta = 800)
+
+  # keep only lines in the top 0.5% by score
+  threshold <- quantile(hl$score, probs = 0.995)
+  n_lines_vec[i] <- sum(hl$score >= threshold)
+}
+
+labels$n_important_lines <- n_lines_vec
+
+cat("Line feature added. Sample values:", head(n_lines_vec, 10), "\n")
+```
+
+Edge detection is a prerequisite for line detection because Hough transform works on a binary edge map — it looks for straight sequences of "edge pixels". If you fed it the raw greyscale image it would just see gradients and brightness variation, not clean lines. Canny sharpens that raw pixel soup into crisp edges that Hough can actually count as lines.
+
+---
+
+# Question 6 — Texture features with Gabor filters
+
+`gabor_feature_extraction()` runs a bank of filters at different scales and orientations. We grab the `gabor_features_real` list (one filtered image per scale) and summarise each with its **mean** and **standard deviation**, giving us a compact set of texture numbers per image.
+
+```{r gabor-texture}
+# run one image first to find out how many scales we get
+test_gabor <- gabor_feature_extraction(
+  image        = images[[1]],
+  scales       = NULL,     # default
+  orientations = NULL,     # default
+  gabor_type   = "2d"
+)
+n_scales <- length(test_gabor$gabor_features_real)
+cat("Number of Gabor scales:", n_scales, "\n")
+
+# feature names: mean and sd for each scale
+gabor_col_names <- c(
+  paste0("gabor_mean_scale", seq_len(n_scales)),
+  paste0("gabor_sd_scale",   seq_len(n_scales))
+)
+
+# extract for all images
+cat("Extracting Gabor features...\n")
+gabor_list <- lapply(seq_along(images), function(i) {
+  if (i %% 200 == 0) cat("  processed", i, "/", length(images), "\n")
+
+  g <- gabor_feature_extraction(
+    image        = images[[i]],
+    scales       = NULL,
+    orientations = NULL,
+    gabor_type   = "2d"
+  )
+
+  means <- sapply(g$gabor_features_real, mean)
+  sds   <- sapply(g$gabor_features_real, sd)
+  c(means, sds)
+})
+
+gabor_matrix <- do.call(rbind, gabor_list)
+colnames(gabor_matrix) <- gabor_col_names
+
+labels <- cbind(labels, gabor_matrix)
+
+cat("Total feature columns now:", ncol(labels), "\n")
+```
+
+The Gabor filter is essentially a tiny wave pattern you slide across the image. It responds strongly wherever there's a repeating texture at a particular scale and direction — think weave patterns in fabric, stitching, or smooth surfaces. The mean tells you how much of that texture is present overall; the SD tells you how varied or localised it is. Together they give the model a sense of how coarse or fine the surface of the clothing looks.
+
+---
+
+# Question 7 — Classification models
+
+We pull together all the features, do an 80/20 train-test split, and train two SVMs — one predicting **brand**, one predicting **product type**. Then we evaluate with accuracy, recall, and F1.
+
+```{r modelling}
+set.seed(42)
+
+# identify feature columns (everything except the label columns)
+label_cols   <- c("brand", "product_type")    # adjust if your CSV uses different names
+feature_cols <- setdiff(names(labels), label_cols)
+
+# remove any rows that ended up with NA features
+complete_rows <- complete.cases(labels[, feature_cols])
+cat("Rows with complete features:", sum(complete_rows), "/", nrow(labels), "\n")
+modelling_data <- labels[complete_rows, ]
+
+# 80 / 20 split
+n          <- nrow(modelling_data)
+train_idx  <- sample(seq_len(n), size = floor(0.8 * n))
+train_data <- modelling_data[ train_idx, ]
+test_data  <- modelling_data[-train_idx, ]
+
+cat("Training rows:", nrow(train_data), " | Test rows:", nrow(test_data), "\n")
+
+# feature matrices
+X_train <- as.matrix(train_data[, feature_cols])
+X_test  <- as.matrix(test_data[, feature_cols])
+
+# scale features (SVMs are sensitive to scale)
+X_train_sc <- scale(X_train)
+scaler_mean <- attr(X_train_sc, "scaled:center")
+scaler_sd   <- attr(X_train_sc, "scaled:scale")
+X_test_sc   <- scale(X_test, center = scaler_mean, scale = scaler_sd)
+```
+
+```{r model-brand}
+# --- Brand model ---
+y_brand_train <- as.factor(train_data$brand)
+y_brand_test  <- as.factor(test_data$brand)
+
+brand_model <- svm(X_train_sc, y_brand_train,
+                   kernel = "linear", cost = 1,
+                   probability = FALSE)
+
+brand_preds <- predict(brand_model, X_test_sc)
+
+cat("\n=== BRAND MODEL ===\n")
+cat("Accuracy:", Accuracy(brand_preds, y_brand_test), "\n")
+cat("Macro F1:", mean(sapply(levels(y_brand_test), function(cls) {
+  F1_Score(y_true = as.integer(y_brand_test == cls),
+           y_pred = as.integer(brand_preds   == cls))
+}), na.rm = TRUE), "\n")
+```
+
+```{r model-product-type}
+# --- Product type model ---
+y_type_train <- as.factor(train_data$product_type)
+y_type_test  <- as.factor(test_data$product_type)
+
+type_model <- svm(X_train_sc, y_type_train,
+                  kernel = "linear", cost = 1,
+                  probability = FALSE)
+
+type_preds <- predict(type_model, X_test_sc)
+
+cat("\n=== PRODUCT TYPE MODEL ===\n")
+cat("Accuracy:", Accuracy(type_preds, y_type_test), "\n")
+cat("Macro F1:", mean(sapply(levels(y_type_test), function(cls) {
+  F1_Score(y_true = as.integer(y_type_test == cls),
+           y_pred = as.integer(type_preds   == cls))
+}), na.rm = TRUE), "\n")
+```
+
+```{r confusion-matrices}
+cat("\nBrand confusion matrix:\n")
+print(table(Predicted = brand_preds, Actual = y_brand_test))
+
+cat("\nProduct type confusion matrix:\n")
+print(table(Predicted = type_preds, Actual = y_type_test))
+```
+
+**Discussion.** Product type (e.g. t-shirt vs trousers vs jacket) is likely the easier prediction task. Shape features like edge counts and line patterns, together with colour histograms, provide pretty strong visual signals for coarse category differences — a pair of jeans genuinely looks very different from a dress. Brand, on the other hand, can share the same product types and colours across brands, so the model has to pick up on more subtle visual cues (logo placement, cut, palette preferences). Expect accuracy to be noticeably lower for brand than for product type.
+```
